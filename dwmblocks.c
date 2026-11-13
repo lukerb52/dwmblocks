@@ -9,7 +9,8 @@
 #include <sys/signalfd.h>
 #include <poll.h>
 #define LENGTH(X) (sizeof(X) / sizeof (X[0]))
-#define CMDLENGTH		50
+#define CMDLENGTH        50
+#define STATUSLENGTH     (LENGTH(blocks) * CMDLENGTH + 1)
 
 typedef struct {
 	char* icon;
@@ -32,12 +33,9 @@ void termhandler(int signum);
 
 #include "config.h"
 
-static Display *dpy;
-static int screen;
-static Window root;
 static char statusbar[LENGTH(blocks)][CMDLENGTH] = {0};
-static char statusstr[2][256];
-static int statusContinue = 1;
+static char statusstr[2][STATUSLENGTH];
+static volatile sig_atomic_t statusContinue = 1;
 static int signalFD;
 static int timerInterval = -1;
 static void (*writestatus) () = setroot;
@@ -79,42 +77,37 @@ int gcd(int a, int b)
 //opens process *cmd and stores output in *output
 void getcmd(const Block *block, char *output)
 {
-	if (block->signal)
-	{
-		output[0] = block->signal;
-		output++;
+	size_t offset = 0;
+	output[0] = '\0';
+	if (block->signal) {
+		output[0] = (char)block->signal;
+		output[1] = '\0';
+		offset = 1;
 	}
-	char *cmd = block->command;
-	FILE *cmdf = popen(cmd,"r");
-	if (!cmdf){
-        //printf("failed to run: %s, %d\n", block->command, errno);
+
+	FILE *cmdf = popen(block->command, "r");
+	if (!cmdf)
 		return;
-    }
-    char tmpstr[CMDLENGTH] = "";
-    // TODO decide whether its better to use the last value till next time or just keep trying while the error was the interrupt
-    // this keeps trying to read if it got nothing and the error was an interrupt
-    //  could also just read to a separate buffer and not move the data over if interrupted
-    //  this way will take longer trying to complete 1 thing but will get it done
-    //  the other way will move on to keep going with everything and the part that failed to read will be wrong till its updated again
-    // either way you have to save the data to a temp buffer because when it fails it writes nothing and then then it gets displayed before this finishes
-	char * s;
-    int e;
-    do {
-        errno = 0;
-        s = fgets(tmpstr, CMDLENGTH-(strlen(delim)+1), cmdf);
-        e = errno;
-    } while (!s && e == EINTR);
+
+	char tmpstr[CMDLENGTH] = "";
+	char *s;
+	int e;
+	do {
+		errno = 0;
+		s = fgets(tmpstr, sizeof(tmpstr), cmdf);
+		e = errno;
+	} while (!s && e == EINTR);
 	pclose(cmdf);
-	int i = strlen(block->icon);
-	strcpy(output, block->icon);
-    strcpy(output+i, tmpstr);
-	remove_all(output, '\n');
-	i = strlen(output);
-    if ((i > 0 && block != &blocks[LENGTH(blocks) - 1])){
-        strcat(output, delim);
-    }
-    i+=strlen(delim);
-	output[i++] = '\0';
+
+	remove_all(tmpstr, '\n');
+	snprintf(output + offset, CMDLENGTH - offset, "%s%s",
+		block->icon ? block->icon : "", tmpstr);
+
+	if (block != &blocks[LENGTH(blocks) - 1]) {
+		size_t used = strlen(output);
+		if (used > offset && used < CMDLENGTH - 1)
+			snprintf(output + used, CMDLENGTH - used, "%s", delim ? delim : "");
+	}
 }
 
 void getcmds(int time)
@@ -167,29 +160,28 @@ void setupsignals()
 
 int getstatus(char *str, char *last)
 {
-	strcpy(last, str);
+	snprintf(last, STATUSLENGTH, "%s", str);
 	str[0] = '\0';
-    for(int i = 0; i < LENGTH(blocks); i++) {
-		strcat(str, statusbar[i]);
-        if (i == LENGTH(blocks) - 1)
-            strcat(str, " ");
-    }
-	str[strlen(str)-1] = '\0';
-	return strcmp(str, last);//0 if they are the same
+	for (size_t i = 0; i < LENGTH(blocks); i++) {
+		size_t used = strlen(str);
+		if (used >= STATUSLENGTH - 1)
+			break;
+		snprintf(str + used, STATUSLENGTH - used, "%s", statusbar[i]);
+	}
+	return strcmp(str, last); // 0 if they are the same
 }
 
 void setroot()
 {
-	if (!getstatus(statusstr[0], statusstr[1]))//Only set root if text has changed.
+	if (!getstatus(statusstr[0], statusstr[1])) // Only set root if text has changed.
 		return;
-	Display *d = XOpenDisplay(NULL);
-	if (d) {
-		dpy = d;
-	}
-	screen = DefaultScreen(dpy);
-	root = RootWindow(dpy, screen);
-	XStoreName(dpy, root, statusstr[0]);
-	XCloseDisplay(dpy);
+	Display *display = XOpenDisplay(NULL);
+	if (!display)
+		return;
+	int display_screen = DefaultScreen(display);
+	Window display_root = RootWindow(display, display_screen);
+	XStoreName(display, display_root, statusstr[0]);
+	XCloseDisplay(display);
 }
 
 void pstdout()
@@ -251,25 +243,30 @@ void sighandler()
 
 void buttonhandler(int ssi_int)
 {
-	char button[2] = {'0' + ssi_int & 0xff, '\0'};
+	char button[2] = {(char)('0' + (ssi_int & 0xff)), '\0'};
 	pid_t process_id = getpid();
 	int sig = ssi_int >> 8;
-	if (fork() == 0)
-	{
-		const Block *current;
-		for (int i = 0; i < LENGTH(blocks); i++)
-		{
-			current = blocks + i;
-			if (current->signal == sig)
-				break;
+	const Block *current = NULL;
+	for (size_t i = 0; i < LENGTH(blocks); i++) {
+		if (blocks[i].signal == (unsigned int)sig) {
+			current = &blocks[i];
+			break;
 		}
+	}
+	if (!current)
+		return;
+
+	if (fork() == 0) {
 		char shcmd[1024];
-		sprintf(shcmd,"%s && kill -%d %d",current->command, current->signal+34,process_id);
-		char *command[] = { "/bin/sh", "-c", shcmd, NULL };
+		int written = snprintf(shcmd, sizeof(shcmd), "%s && kill -%u %d",
+			current->command, current->signal + SIGRTMIN, process_id);
+		if (written < 0 || (size_t)written >= sizeof(shcmd))
+			_exit(EXIT_FAILURE);
+		char *command[] = {"/bin/sh", "-c", shcmd, NULL};
 		setenv("BLOCK_BUTTON", button, 1);
 		setsid();
 		execvp(command[0], command);
-		exit(EXIT_SUCCESS);
+		_exit(EXIT_FAILURE);
 	}
 }
 
@@ -279,17 +276,23 @@ void termhandler(int signum)
 	statusContinue = 0;
 }
 
-int main(int argc, char** argv)
+int main(int argc, char **argv)
 {
-	for(int i = 0; i < argc; i++)
-	{
-		if (!strcmp("-d",argv[i]))
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp("-d", argv[i])) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "dwmblocks: -d requires a delimiter\n");
+				return EXIT_FAILURE;
+			}
 			delim = argv[++i];
-		else if(!strcmp("-p",argv[i]))
+		} else if (!strcmp("-p", argv[i])) {
 			writestatus = pstdout;
+		}
 	}
 	signal(SIGTERM, termhandler);
 	signal(SIGINT, termhandler);
 	statusloop();
-	close(signalFD);
+	if (signalFD >= 0)
+		close(signalFD);
+	return EXIT_SUCCESS;
 }
